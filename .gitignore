@@ -16,6 +16,7 @@ __pycache__/
 *.tflite
 *.onnx
 results/
+models_registry/
 tmp/
 cache/
 
