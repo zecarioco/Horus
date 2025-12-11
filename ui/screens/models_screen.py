@@ -19,9 +19,9 @@ class ModelsScreen(QWidget):
         layout.addWidget(self.title)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
+        self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels([
-            "Nome", "F1", "Precision", "Recall", "Data"
+            "Nome", "F1", "Precision", "Recall"
         ])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -53,7 +53,6 @@ class ModelsScreen(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(str(f1)))
             self.table.setItem(row, 2, QTableWidgetItem(str(precision)))
             self.table.setItem(row, 3, QTableWidgetItem(str(recall)))
-            self.table.setItem(row, 4, QTableWidgetItem(timestamp))
 
         self.table.resizeColumnsToContents()
 

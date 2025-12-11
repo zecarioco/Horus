@@ -1,6 +1,7 @@
 import json
 import os
 import torch
+import torch.nn as nn
 from datetime import datetime
 from transformers import (
     AutoModelForSequenceClassification,
@@ -8,68 +9,44 @@ from transformers import (
     AutoTokenizer,
     Trainer
 )
-import torch.nn as nn
 from backend.models_registry import register_model
+from sklearn.metrics import precision_recall_fscore_support
+import numpy as np
 
 def compute_metrics(pred):
-    logits = torch.sigmoid(torch.tensor(pred.predictions))
-    preds = (logits > 0.5).int()
-    labels = torch.tensor(pred.label_ids).int()
+    logits = pred.predictions
+    probs = torch.sigmoid(torch.from_numpy(logits)).numpy()
+    labels = pred.label_ids
+    
+    preds = (probs > 0.5).astype(int) 
 
-    true_pos = (preds & labels).sum(dim=0).float()
-    pred_pos = preds.sum(dim=0).float()
-    actual_pos = labels.sum(dim=0).float()
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels, preds, average='micro', zero_division=0
+    )
+    
+    return {
+        "precision": precision, 
+        "recall": recall, 
+        "f1": f1
+    }
 
-    precision = (true_pos / (pred_pos + 1e-8)).mean().item()
-    recall = (true_pos / (actual_pos + 1e-8)).mean().item()
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-    return {"precision": precision, "recall": recall, "f1": f1}
-
-class MultiLabelFocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        bce_loss = nn.functional.binary_cross_entropy_with_logits(
-            logits, targets, reduction="none"
-        )
-
-        probs = torch.sigmoid(logits)
-
-        pt = torch.where(targets == 1, probs, 1 - probs)
-        focal_weight = (1 - pt) ** self.gamma
-
-        if self.alpha is not None:
-            alpha = self.alpha.to(logits.device)
-            alpha_factor = torch.where(targets == 1, alpha, 1 - alpha)
-            focal_weight = focal_weight * alpha_factor
-
-        loss = focal_weight * bce_loss
-
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
-        return loss
-
-class MultiLabelTrainer(Trainer):
-
-    def __init__(self, alpha=None, gamma=2.0, *args, **kwargs):
+class WeightedBCE_Trainer(Trainer):
+    def __init__(self, pos_weight=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.alpha = alpha
-        self.gamma = gamma
-        self.loss_fct = MultiLabelFocalLoss(alpha=alpha, gamma=gamma)
+        self.pos_weight = pos_weight
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
 
-        loss = self.loss_fct(logits, labels.float())
+        if self.pos_weight is not None:
+            weights = self.pos_weight.to(logits.device)
+            loss_fct = nn.BCEWithLogitsLoss(pos_weight=weights)
+        else:
+            loss_fct = nn.BCEWithLogitsLoss()
+
+        loss = loss_fct(logits, labels.float())
 
         if return_outputs:
             return loss, outputs
@@ -80,10 +57,10 @@ class TrainerWorker:
         self,
         model_name="neuralmind/bert-base-portuguese-cased",
         base_output_dir="./results",
-        learning_rate=2e-5,
+        learning_rate=2e-5, 
         epochs=3,
         batch_size=8,
-        fp16=True,
+        fp16=False, 
         run_name=None,
         display_name=None
     ):
@@ -101,17 +78,16 @@ class TrainerWorker:
         self.output_dir = os.path.join(self.base_output_dir, run_name)
         os.makedirs(self.output_dir, exist_ok=True)
 
-
-
     @staticmethod
-    def compute_class_weights(dataset, label_cols):
+    def compute_class_weights(dataset):
         labels = torch.stack([x["labels"] for x in dataset], dim=0)
+        
         positives = labels.sum(dim=0)
-        negatives = (labels.shape[0] - positives)
+        negatives = labels.shape[0] - positives
+        
         pos_weight = negatives / (positives + 1e-8)
+        
         return pos_weight
-
-
 
     def load_or_initialize_model(self, num_labels):
         checkpoint = os.path.join(self.output_dir, "checkpoint-final")
@@ -127,8 +103,6 @@ class TrainerWorker:
         )
         model.config.problem_type = "multi_label_classification"
         return model.to(self.device)
-
-
 
     @staticmethod
     def compute_optimal_thresholds(model, dataset, device, label_cols):
@@ -153,28 +127,29 @@ class TrainerWorker:
         all_labels = torch.cat(all_labels, dim=0)
 
         thresholds = {}
+        threshold_range = np.arange(0.01, 1.0, 0.01)
 
         for i, label in enumerate(label_cols):
-            best_f1 = 0
+            best_f1 = -1.0
             best_t = 0.5
+            
+            y_true = all_labels[:, i].int().numpy()
+            probs_col = all_probs[:, i].numpy()
 
-            for t in [x / 100 for x in range(1, 100)]:
-                preds = (all_probs[:, i] > t).int()
-                true = all_labels[:, i].int()
-
-                tp = (preds & true).sum().item()
-                fp = ((preds == 1) & (true == 0)).sum().item()
-                fn = ((preds == 0) & (true == 1)).sum().item()
-
-                precision = tp / (tp + fp + 1e-8)
-                recall = tp / (tp + fn + 1e-8)
-                f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            for t in threshold_range:
+                y_pred = (probs_col > t).astype(int)
+                
+                tp = np.sum((y_pred == 1) & (y_true == 1))
+                fp = np.sum((y_pred == 1) & (y_true == 0))
+                fn = np.sum((y_pred == 0) & (y_true == 1))
+                
+                f1 = (2 * tp) / (2 * tp + fp + fn + 1e-8)
 
                 if f1 > best_f1:
                     best_f1 = f1
                     best_t = t
 
-            thresholds[label] = best_t
+            thresholds[label] = float(best_t)
 
         return thresholds
 
@@ -183,33 +158,33 @@ class TrainerWorker:
 
         model.config.id2label = {i: label for i, label in enumerate(label_cols)}
         model.config.label2id = {label: i for i, label in enumerate(label_cols)}
-        model.config.num_labels = len(label_cols)
-        model.config.problem_type = "multi_label_classification"
-
+        
         args = TrainingArguments(
             output_dir=self.output_dir,
             num_train_epochs=self.epochs,
             learning_rate=self.learning_rate,
             per_device_train_batch_size=self.batch_size,
             per_device_eval_batch_size=self.batch_size,
+            weight_decay=0.01,
+            warmup_ratio=0.1,
             logging_steps=50,
             eval_strategy="epoch",
             save_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
             fp16=self.fp16 and torch.cuda.is_available(),
-            load_best_model_at_end=False
         )
 
-        alpha = None
+        pos_weight = self.compute_class_weights(train_dataset)
 
-        trainer = MultiLabelTrainer(
+        trainer = WeightedBCE_Trainer(
             model=model,
             args=args,
             train_dataset=train_dataset,
             eval_dataset=test_dataset,
             tokenizer=tokenizer,
             compute_metrics=compute_metrics,
-            alpha=alpha,
-            gamma=2.0
+            pos_weight=pos_weight
         )
 
         trainer.train()
@@ -217,8 +192,10 @@ class TrainerWorker:
 
         metrics = trainer.evaluate()
 
-        thresholds = TrainerWorker.compute_optimal_thresholds(
-            model=model,
+        best_model = AutoModelForSequenceClassification.from_pretrained(self.output_dir).to(self.device)
+
+        thresholds = self.compute_optimal_thresholds(
+            model=best_model,
             dataset=test_dataset,
             device=self.device,
             label_cols=label_cols
@@ -228,6 +205,7 @@ class TrainerWorker:
             json.dump(thresholds, f, indent=4, ensure_ascii=False)
 
         metadata = {
+            "model_name": self.model_name,
             "learning_rate": self.learning_rate,
             "epochs": self.epochs,
             "batch_size": self.batch_size,
@@ -248,8 +226,6 @@ class TrainerWorker:
         register_model(model_info)
         return metrics
 
-
-
     @staticmethod
     def run_detection(model_dir: str, text: str, device=None):
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -260,7 +236,7 @@ class TrainerWorker:
         try:
             with open(f"{model_dir}/thresholds.json", "r", encoding="utf-8") as f:
                 thresholds = json.load(f)
-        except:
+        except Exception:
             thresholds = {}
 
         model.to(device)
@@ -279,13 +255,16 @@ class TrainerWorker:
             logits = model(**inputs).logits
             probs = torch.sigmoid(logits).cpu().squeeze().tolist()
 
-        labels = [model.config.id2label[i] for i in range(len(probs))]
+        if isinstance(probs, float):
+            probs = [probs]
+            
+        labels = [model.config.id2label.get(i, f"class_{i}") for i in range(len(probs))]
 
         all_probs = {label: float(prob) for label, prob in zip(labels, probs)}
 
         passed = []
         for label, prob in all_probs.items():
-            threshold = thresholds.get(label, 0.5)
+            threshold = thresholds.get(label, 0.4)
             if prob >= threshold:
                 passed.append(label)
 

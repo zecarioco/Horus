@@ -40,7 +40,7 @@ class TrainScreen(QWidget):
         layout.addWidget(self.max_length_input)
 
         self.epoch_input = QSpinBox()
-        self.epoch_input.setRange(1, 50)
+        self.epoch_input.setRange(1, 300000)
         self.epoch_input.setValue(3)
         self.epoch_input.setStyleSheet("background-color: #1e1e1e; color: white; padding: 6px;")
         layout.addWidget(QLabel("Épocas:"))

@@ -4,10 +4,11 @@ from backend.trainer_worker import TrainerWorker
 def run_training(
     max_length=128,
     epochs=3,
-    lr=2e-5,
+    lr=2e-6, 
     batch_size=8,
     display_name=None,
     model_name="neuralmind/bert-base-portuguese-cased",
+    fp16=False, 
 ):
     dm = DataManager(model_name=model_name)
 
@@ -18,7 +19,8 @@ def run_training(
         learning_rate=lr,
         epochs=epochs,
         batch_size=batch_size,
-        model_name=model_name
+        model_name=model_name,
+        fp16=fp16 
     )
 
     metrics = trainer.train(
